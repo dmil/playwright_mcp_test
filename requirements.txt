@@ -1,0 +1,14 @@
+# Python dependencies for Social Media Links Extractor
+# Install with: pip install -r requirements.txt
+
+# MCP (Model Context Protocol) client
+mcp>=1.24.0
+
+# Anthropic API client
+anthropic>=0.75.0
+
+# Environment variables
+python-dotenv>=1.2.0
+
+# Additional helpful dependencies (installed with mcp)
+pydantic>=2.7.4
