@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Script to extract social media links from a website using Claude with Playwright MCP.
+Script to extract social media links from a website using a hybrid approach.
 
 This script demonstrates how to:
-1. Connect to the Playwright MCP server
-2. Use Claude with MCP tools to navigate and close popups intelligently
-3. Extract social media links using MCP
+1. Navigate to a webpage using regular Playwright
+2. Use Claude with Playwright MCP to find the CSS selector for the social links container
+3. Extract the actual links using regular Playwright (deterministic code)
 4. Process the links into a clean dictionary format with Python
+
+This approach minimizes reliance on MCP and uses it only where AI-powered element
+detection is most valuable (finding the right container selector).
 """
 
 import asyncio
@@ -14,6 +17,7 @@ import json
 import os
 from urllib.parse import urlparse
 from dotenv import load_dotenv
+from playwright.async_api import async_playwright
 from mcp_client import PlaywrightMCPClient
 
 # Load environment variables from .env file
@@ -68,23 +72,18 @@ def process_social_links(links):
     return social_dict
 
 
-async def get_social_links_with_mcp(url):
+async def get_container_selector_with_mcp(url):
     """
-    Use Claude with Playwright MCP to navigate to a URL and extract social links.
+    Use Claude with Playwright MCP to find the CSS selector for the social links container.
 
-    This function:
-    1. Connects to the Playwright MCP server
-    2. Runs an agentic loop where Claude uses MCP tools to:
-       - Navigate to the URL
-       - Close popups intelligently
-       - Extract social media links
-    3. Returns the extracted links as a list
+    This function uses MCP ONLY to identify the container selector, not to extract the links.
+    It will navigate to the page via MCP and ask Claude to find the appropriate selector.
 
     Args:
-        url: The website URL to scrape for social media links
+        url: The website URL to analyze
 
     Returns:
-        List of social media link URLs
+        CSS selector string for the container with social media links
     """
     # Check if API key is set
     api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -92,7 +91,7 @@ async def get_social_links_with_mcp(url):
         print("\nError: Please set your ANTHROPIC_API_KEY in the .env file")
         print("Get your API key from: https://console.anthropic.com/settings/keys")
         print("Then add it to the .env file in this directory\n")
-        return []
+        return None
 
     # Create the MCP client
     client = PlaywrightMCPClient(api_key)
@@ -101,37 +100,34 @@ async def get_social_links_with_mcp(url):
         # Connect to the Playwright MCP server
         await client.connect()
 
-        # Create the prompt for Claude
+        # Create the prompt for Claude - asking ONLY for the container selector
         user_message = f"""
 Please use the Playwright MCP tools to complete the following task:
 
 1. Navigate to {url}
 2. Wait for the page to load
-3. Use the MCP to close any popups that appear (like newsletter signups, cookie notices, etc.)
-4. Find the social media links on the page (look for links to Facebook, Twitter/X, Instagram, YouTube, etc.)
-5. Extract all the social media link URLs
-6. Use the "report_social_links" tool to return the list of URLs
+3. Close any popups if they appear
+4. Find the container element that holds the social media links (Facebook, Twitter/X, Instagram, YouTube, etc.)
+5. Return the CSS selector for that container using the "report_selector" tool
 
-Make sure to extract all social media links you can find on the page.
+IMPORTANT: Return the CSS selector for the CONTAINER element, not the individual links.
+The selector should be something that can be passed to page.locator() in Playwright.
+For example: "nav.social-links", ".footer-social", "[aria-label='Social Media']", etc.
 """
 
-        # Define a structured output tool for Claude to use
+        # Define a structured output tool for Claude to report the selector
         final_answer_tool = {
-            "name": "report_social_links",
-            "description": "Report the extracted social media links as a structured list",
+            "name": "report_selector",
+            "description": "Report the CSS selector for the social links container",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "links": {
-                        "type": "array",
-                        "items": {
-                            "type": "string",
-                            "description": "A social media URL"
-                        },
-                        "description": "List of social media link URLs"
+                    "selector": {
+                        "type": "string",
+                        "description": "The CSS selector for the container element holding the social media links"
                     }
                 },
-                "required": ["links"]
+                "required": ["selector"]
             }
         }
 
@@ -142,44 +138,118 @@ Make sure to extract all social media links you can find on the page.
             final_answer_tool=final_answer_tool
         )
 
-        # Extract the links from the structured response
-        if isinstance(response, dict) and "links" in response:
-            social_links = response["links"]
+        # Extract the selector from the structured response
+        if isinstance(response, dict) and "selector" in response:
+            selector = response["selector"]
+            return selector
         else:
             print(f"Unexpected response format: {response}")
-            social_links = []
-
-        return social_links
+            return None
 
     finally:
         # Always disconnect from the MCP server
         await client.disconnect()
 
 
+async def extract_social_links_with_playwright(url, container_selector):
+    """
+    Use regular Playwright to navigate to a page and extract all links from a container.
+
+    This is deterministic code that doesn't require AI - it simply:
+    1. Navigates to the URL
+    2. Finds the container using the provided selector
+    3. Extracts all links from within that container
+
+    Args:
+        url: The website URL to scrape
+        container_selector: CSS selector for the container element
+
+    Returns:
+        List of all link URLs found in the container
+    """
+    async with async_playwright() as p:
+        # Launch browser (headless mode)
+        browser = await p.chromium.launch(headless=False)
+        page = await browser.new_page()
+
+        try:
+            # Navigate to the URL (wait for DOM to load, not network idle)
+            print(f"Navigating to {url}...")
+            await page.goto(url, wait_until='domcontentloaded')
+
+            # Find the container element
+            container = page.locator(container_selector)
+
+            # Wait for the container to be visible on the page
+            try:
+                await container.first.wait_for(state='attached', timeout=10000)
+                print(f"Found container with selector: {container_selector}")
+            except Exception as e:
+                print(f"Warning: Container '{container_selector}' not found or not visible: {e}")
+                return []
+
+            # Get all links within the container
+            links = container.locator('a')
+            link_count = await links.count()
+            print(f"Found {link_count} links in the container")
+
+            # Extract href attributes from all links
+            all_links = []
+            for i in range(link_count):
+                link = links.nth(i)
+                href = await link.get_attribute('href')
+
+                # Add any valid href to the list
+                if href:
+                    all_links.append(href)
+
+            return all_links
+
+        finally:
+            # Close the browser
+            await browser.close()
+
+
 async def main():
     """
-    Main function to run the social links extraction.
+    Main function to run the social links extraction using a hybrid approach.
+
+    Workflow:
+    1. Use MCP to get the CSS selector for the social links container
+    2. Use regular Playwright to navigate and extract the actual links
+    3. Process the results into a clean dictionary format
     """
     # The URL to scrape for social media links
-    target_url = "https://crawford.house.gov/"
+    target_url = "https://omar.house.gov/"
 
     print("=" * 70)
     print("  Social Media Links Extractor")
-    print("  (Using Claude + Playwright MCP)")
+    print("  (Hybrid: MCP for selector + Playwright for extraction)")
     print("=" * 70)
     print(f"Target URL: {target_url}\n")
 
-    # Get the social links using Claude with Playwright MCP
-    social_links_list = await get_social_links_with_mcp(target_url)
+    # Step 1: Use MCP to get the container selector
+    print("Step 1: Using Playwright MCP to find container selector...")
+    container_selector = await get_container_selector_with_mcp(target_url)
+
+    if not container_selector:
+        print("\n✗ Failed to get container selector from MCP")
+        return
+
+    print(f"✓ Got container selector: {container_selector}\n")
+
+    # Step 2: Use regular Playwright to extract the links
+    print("Step 2: Using regular Playwright to extract links...")
+    social_links_list = await extract_social_links_with_playwright(target_url, container_selector)
 
     if not social_links_list:
-        print("\n✗ No social links found or error occurred")
+        print("\n✗ No social links found")
         return
 
     print(f"\n✓ Extracted {len(social_links_list)} social media links")
 
-    # Process the links into dictionary format using Python
-    print("\nProcessing links into dictionary format...")
+    # Step 3: Process the links into dictionary format using Python
+    print("\nStep 3: Processing links into dictionary format...")
     social_links_dict = process_social_links(social_links_list)
 
     # Print the result as formatted JSON
