@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-Script to extract social media links from omar.house.gov using Playwright.
+Script to extract social media links from a website using Claude with Playwright MCP.
 
 This script demonstrates how to:
-1. Use Playwright Python library to navigate to a website
-2. Close popups automatically
-3. Extract social media links from the page
-4. Process the links into a clean dictionary format
+1. Connect to the Playwright MCP server
+2. Use Claude with MCP tools to navigate and close popups intelligently
+3. Extract social media links using MCP
+4. Process the links into a clean dictionary format with Python
 """
 
+import asyncio
 import json
+import os
 from urllib.parse import urlparse
-from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
+from mcp_client import PlaywrightMCPClient
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 def extract_domain_name(url):
@@ -62,140 +68,135 @@ def process_social_links(links):
     return social_dict
 
 
-def close_popups(page):
+async def get_social_links_with_mcp(url):
     """
-    Close any popups on the page (like newsletter signups, cookie notices, etc.).
+    Use Claude with Playwright MCP to navigate to a URL and extract social links.
 
-    This function attempts to close common popup patterns:
-    - Buttons with "Close dialog" text
-    - Close buttons with X symbols
-    - Cookie consent dialogs
-
-    Args:
-        page: The Playwright page object
-
-    Returns:
-        None
-    """
-    print("Closing any popups...")
-
-    # List of common close button patterns to try
-    close_patterns = [
-        'button:has-text("Close dialog")',
-        'button:has-text("Close")',
-        'button[aria-label*="close" i]',
-        'button:has-text("✕")',
-        'button:has-text("×")',
-        '.close-button',
-        '.modal-close'
-    ]
-
-    # Try each pattern to find and close popups
-    for pattern in close_patterns:
-        try:
-            close_button = page.locator(pattern).first
-            if close_button.is_visible(timeout=1000):
-                close_button.click()
-                print(f"Popup closed successfully using pattern: {pattern}")
-                # Wait a moment for the popup to close
-                page.wait_for_timeout(500)
-                return
-        except Exception:
-            # This pattern didn't work, try the next one
-            continue
-
-    print("No popups found to close")
-
-
-def get_social_links(url):
-    """
-    Use Playwright to navigate to a URL and extract social media links.
+    This function:
+    1. Connects to the Playwright MCP server
+    2. Runs an agentic loop where Claude uses MCP tools to:
+       - Navigate to the URL
+       - Close popups intelligently
+       - Extract social media links
+    3. Returns the extracted links as a list
 
     Args:
         url: The website URL to scrape for social media links
 
     Returns:
-        Dictionary of social media links with platform names as keys
+        List of social media link URLs
     """
-    # Start Playwright
-    with sync_playwright() as p:
-        # Launch the browser with your system Chromium
-        # headless=False means you can see the browser window
-        browser = p.chromium.launch(
-            executable_path="/usr/bin/chromium",
-            headless=False
+    # Check if API key is set
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key or api_key == "your_api_key_here":
+        print("\nError: Please set your ANTHROPIC_API_KEY in the .env file")
+        print("Get your API key from: https://console.anthropic.com/settings/keys")
+        print("Then add it to the .env file in this directory\n")
+        return []
+
+    # Create the MCP client
+    client = PlaywrightMCPClient(api_key)
+
+    try:
+        # Connect to the Playwright MCP server
+        await client.connect()
+
+        # Create the prompt for Claude
+        user_message = f"""
+Please use the Playwright MCP tools to complete the following task:
+
+1. Navigate to {url}
+2. Wait for the page to load
+3. Use the MCP to close any popups that appear (like newsletter signups, cookie notices, etc.)
+4. Find the social media links on the page (look for links to Facebook, Twitter/X, Instagram, YouTube, etc.)
+5. Extract all the social media link URLs
+6. Use the "report_social_links" tool to return the list of URLs
+
+Make sure to extract all social media links you can find on the page.
+"""
+
+        # Define a structured output tool for Claude to use
+        final_answer_tool = {
+            "name": "report_social_links",
+            "description": "Report the extracted social media links as a structured list",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "links": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "description": "A social media URL"
+                        },
+                        "description": "List of social media link URLs"
+                    }
+                },
+                "required": ["links"]
+            }
+        }
+
+        # Run the agentic loop with structured output
+        response = await client.run_agent_loop(
+            user_message,
+            max_iterations=15,
+            final_answer_tool=final_answer_tool
         )
 
-        # Create a new page/tab
-        page = browser.new_page()
+        # Extract the links from the structured response
+        if isinstance(response, dict) and "links" in response:
+            social_links = response["links"]
+        else:
+            print(f"Unexpected response format: {response}")
+            social_links = []
 
-        print(f"Navigating to {url}...")
-        # Navigate to the website
-        page.goto(url, wait_until="domcontentloaded")
+        return social_links
 
-        # Wait a moment for dynamic content to load
-        page.wait_for_timeout(2000)
-
-        # Close any popups using the dedicated function
-        close_popups(page)
-
-        print("Extracting social media links...")
-        # Find the social links container
-        # The container has class 'evo-social-icons-here'
-        social_container = page.locator('.evo-social-icons-here')
-
-        # Extract all links within the container
-        social_links_elements = social_container.locator('a')
-
-        # Get the href attributes from all social links
-        links = []
-        count = social_links_elements.count()
-
-        for i in range(count):
-            link = social_links_elements.nth(i)
-            href = link.get_attribute('href')
-            if href:
-                links.append(href)
-
-        print(f"Found {len(links)} social media links")
-
-        # Close the browser
-        browser.close()
-
-        # Process the links into dictionary format
-        social_dict = process_social_links(links)
-
-        return social_dict
+    finally:
+        # Always disconnect from the MCP server
+        await client.disconnect()
 
 
-def main():
+async def main():
     """
     Main function to run the social links extraction.
     """
     # The URL to scrape for social media links
-    target_url = "https://omar.house.gov/"
+    target_url = "https://crawford.house.gov/"
 
-    print("=" * 60)
-    print(f"Social Media Links Extractor")
-    print(f"Target: {target_url}")
-    print("=" * 60)
+    print("=" * 70)
+    print("  Social Media Links Extractor")
+    print("  (Using Claude + Playwright MCP)")
+    print("=" * 70)
+    print(f"Target URL: {target_url}\n")
 
-    # Get the social links
-    social_links = get_social_links(target_url)
+    # Get the social links using Claude with Playwright MCP
+    social_links_list = await get_social_links_with_mcp(target_url)
+
+    if not social_links_list:
+        print("\n✗ No social links found or error occurred")
+        return
+
+    print(f"\n✓ Extracted {len(social_links_list)} social media links")
+
+    # Process the links into dictionary format using Python
+    print("\nProcessing links into dictionary format...")
+    social_links_dict = process_social_links(social_links_list)
 
     # Print the result as formatted JSON
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("Social Media Links:")
-    print("=" * 60)
-    print(json.dumps(social_links, indent=2))
+    print("=" * 70)
+    print(json.dumps(social_links_dict, indent=2))
 
     # Also save to a file
     output_file = "social_links.json"
     with open(output_file, 'w') as f:
-        json.dump(social_links, f, indent=2)
+        json.dump(social_links_dict, f, indent=2)
 
-    print(f"\nResults saved to {output_file}")
+    print(f"\n✓ Results saved to {output_file}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    main()
+    # Run the async main function
+    asyncio.run(main())
